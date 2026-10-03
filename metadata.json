@@ -1,0 +1,6 @@
+{
+  "name": "AeroProximity - Closest Airplane Tracker",
+  "description": "Real-time aerial radar tracking the closest aircraft to your location with flight number, altitude, airspeed, aircraft type, and destination powered by FlightAware API.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

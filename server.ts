@@ -1,0 +1,547 @@
+import express, { Request, Response } from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+import {
+  calculateDistanceKm,
+  kmToNm,
+  kmToMiles,
+  calculateBearingDeg,
+  bearingToCardinal,
+  calculateElevationAngleDeg,
+  calculateCpaMinutes,
+  feetToMeters,
+  knotsToMph,
+  knotsToKmh,
+} from './src/utils/geo.js';
+import {
+  MAJOR_AIRPORTS,
+  lookupAirline,
+  lookupAircraft,
+} from './src/data/aviationReference.js';
+import { AircraftInfo, RadarDataResponse, Airport, ReceiverStatus } from './src/types/aviation.js';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+
+// Simulation fleet for smooth visualization if receiver is currently offline
+interface SimAircraft {
+  icao24: string;
+  ident: string;
+  registration: string;
+  callsign: string;
+  airline: string;
+  aircraftType: string;
+  aircraftModel: string;
+  aircraftCategory: string;
+  lat: number;
+  lon: number;
+  altitudeFt: number;
+  speedKts: number;
+  headingDeg: number;
+  verticalRateFpm: number;
+  rssi: number;
+  messages: number;
+  origin: Airport;
+  destination: Airport;
+  lastUpdate: number;
+}
+
+let simulatedFleet: SimAircraft[] = [];
+let simCenterLat = 37.7749;
+let simCenterLon = -122.4194;
+let simFleetTime = Date.now();
+
+// Cache detected tar1090 working path per base URL
+const detectedEndpointsCache = new Map<string, string>();
+const receiverConfigCache = new Map<string, { lat?: number; lon?: number; version?: string }>();
+
+function findNearestAirport(lat: number, lon: number, excludeCode?: string): Airport {
+  let closest = MAJOR_AIRPORTS[0];
+  let minDist = Infinity;
+  for (const ap of MAJOR_AIRPORTS) {
+    if (excludeCode && ap.code === excludeCode) continue;
+    const d = calculateDistanceKm(lat, lon, ap.lat, ap.lon);
+    if (d < minDist) {
+      minDist = d;
+      closest = ap;
+    }
+  }
+  return closest;
+}
+
+function getRandomAirport(excludeCode?: string): Airport {
+  const filtered = MAJOR_AIRPORTS.filter((a) => a.code !== excludeCode);
+  return filtered[Math.floor(Math.random() * filtered.length)];
+}
+
+function initializeSimFleet(centerLat: number, centerLon: number) {
+  simCenterLat = centerLat;
+  simCenterLon = centerLon;
+  simFleetTime = Date.now();
+
+  const presets = [
+    { prefix: 'UAL', num: 428, reg: 'N29985', type: 'B789', orig: 'SFO', dest: 'JFK', alt: 35000, spd: 485, dist: 12, angle: 45, rssi: -11.4 },
+    { prefix: 'DAL', num: 1204, reg: 'N531DN', type: 'A321', orig: 'LAX', dest: 'SEA', alt: 28000, spd: 440, dist: 22, angle: 160, rssi: -14.2 },
+    { prefix: 'AAL', num: 890, reg: 'N902AN', type: 'B738', orig: 'DFW', dest: 'ORD', alt: 31000, spd: 460, dist: 35, angle: 280, rssi: -18.7 },
+    { prefix: 'SWA', num: 1542, reg: 'N8714Q', type: 'B38M', orig: 'DEN', dest: 'LAS', alt: 18500, spd: 390, dist: 7, angle: 95, rssi: -8.1 },
+    { prefix: 'BAW', num: 286, reg: 'G-XWBG', type: 'A359', orig: 'LHR', dest: 'SFO', alt: 11000, spd: 280, dist: 18, angle: 310, rssi: -12.9 },
+    { prefix: 'ASA', num: 337, reg: 'N419AS', type: 'B739', orig: 'SEA', dest: 'SAN', alt: 33000, spd: 470, dist: 48, angle: 215, rssi: -22.3 },
+    { prefix: 'AFR', num: 84, reg: 'F-HREB', type: 'A35K', orig: 'CDG', dest: 'LAX', alt: 37000, spd: 505, dist: 55, angle: 10, rssi: -24.8 },
+  ];
+
+  simulatedFleet = presets.map((p, idx) => {
+    const ident = `${p.prefix}${p.num}`;
+    const airlineInfo = lookupAirline(ident);
+    const aircraftInfo = lookupAircraft(p.type);
+    const origin = MAJOR_AIRPORTS.find((a) => a.code === p.orig) || getRandomAirport();
+    const destination = MAJOR_AIRPORTS.find((a) => a.code === p.dest) || getRandomAirport(origin.code);
+
+    const angleRad = (p.angle * Math.PI) / 180;
+    const distDeg = (p.dist * 1.852) / 111;
+    const lat = centerLat + distDeg * Math.cos(angleRad);
+    const lon = centerLon + (distDeg * Math.sin(angleRad)) / Math.cos((centerLat * Math.PI) / 180);
+    const heading = (p.angle + 85 + (Math.random() * 20 - 10)) % 360;
+
+    return {
+      icao24: `a${(100000 + idx * 12345).toString(16)}`,
+      ident,
+      registration: p.reg,
+      callsign: `${airlineInfo.name.split(' ')[0]} ${p.num}`,
+      airline: airlineInfo.name,
+      aircraftType: p.type,
+      aircraftModel: aircraftInfo.model,
+      aircraftCategory: aircraftInfo.category,
+      lat,
+      lon,
+      altitudeFt: p.alt,
+      speedKts: p.spd,
+      headingDeg: Math.round(heading),
+      verticalRateFpm: Math.random() > 0.6 ? (Math.random() > 0.5 ? 400 : -600) : 0,
+      rssi: p.rssi,
+      messages: Math.floor(250 + Math.random() * 1200),
+      origin,
+      destination,
+      lastUpdate: Date.now(),
+    };
+  });
+}
+
+function updateSimFleet(userLat: number, userLon: number) {
+  const now = Date.now();
+  const dtSec = Math.max(0.5, (now - simFleetTime) / 1000);
+  simFleetTime = now;
+
+  if (
+    simulatedFleet.length === 0 ||
+    calculateDistanceKm(userLat, userLon, simCenterLat, simCenterLon) > 100
+  ) {
+    initializeSimFleet(userLat, userLon);
+    return;
+  }
+
+  for (const ac of simulatedFleet) {
+    const distKm = (ac.speedKts * 1.852 * dtSec) / 3600;
+    const headingRad = (ac.headingDeg * Math.PI) / 180;
+
+    const deltaLat = (distKm * Math.cos(headingRad)) / 111;
+    const deltaLon = (distKm * Math.sin(headingRad)) / (111 * Math.cos((ac.lat * Math.PI) / 180));
+
+    ac.lat += deltaLat;
+    ac.lon += deltaLon;
+    ac.messages += Math.floor(1 + Math.random() * 3);
+
+    if (ac.verticalRateFpm !== 0) {
+      ac.altitudeFt += (ac.verticalRateFpm * dtSec) / 60;
+      if (ac.altitudeFt > 41000) ac.verticalRateFpm = -400;
+      if (ac.altitudeFt < 3000) ac.verticalRateFpm = 500;
+    }
+
+    const distToUserNm = kmToNm(calculateDistanceKm(userLat, userLon, ac.lat, ac.lon));
+    if (distToUserNm > 85) {
+      const entryAngle = (ac.headingDeg + 180 + (Math.random() * 40 - 20)) % 360;
+      const entryRad = (entryAngle * Math.PI) / 180;
+      const entryDistDeg = (55 * 1.852) / 111;
+      ac.lat = userLat + entryDistDeg * Math.cos(entryRad);
+      ac.lon = userLon + (entryDistDeg * Math.sin(entryRad)) / Math.cos((userLat * Math.PI) / 180);
+      ac.headingDeg = (calculateBearingDeg(ac.lat, ac.lon, userLat, userLon) + (Math.random() * 30 - 15) + 360) % 360;
+    }
+  }
+}
+
+// Transform raw tar1090/readsb aircraft JSON item into AircraftInfo
+function processTar1090Aircraft(
+  raw: any,
+  userLat: number,
+  userLon: number,
+  receiverBaseUrl: string,
+  source: 'tar1090' | 'simulated'
+): AircraftInfo | null {
+  if (typeof raw.lat !== 'number' || typeof raw.lon !== 'number') {
+    return null;
+  }
+
+  const icao24 = (raw.hex || raw.icao24 || '').toLowerCase().trim();
+  const rawFlight = (raw.flight || raw.ident || '').trim().toUpperCase();
+  const ident = rawFlight || icao24.toUpperCase();
+
+  const distKm = calculateDistanceKm(userLat, userLon, raw.lat, raw.lon);
+  const distNm = kmToNm(distKm);
+  const distMiles = kmToMiles(distKm);
+  const bearingDeg = calculateBearingDeg(userLat, userLon, raw.lat, raw.lon);
+  const cardinal = bearingToCardinal(bearingDeg);
+
+  const altitudeFt = typeof raw.alt_baro === 'number'
+    ? raw.alt_baro
+    : typeof raw.alt_geom === 'number'
+    ? raw.alt_geom
+    : typeof raw.altitudeFt === 'number'
+    ? raw.altitudeFt
+    : 0;
+
+  const speedKts = typeof raw.gs === 'number'
+    ? raw.gs
+    : typeof raw.speedKts === 'number'
+    ? raw.speedKts
+    : 0;
+
+  const headingDeg = typeof raw.track === 'number'
+    ? raw.track
+    : typeof raw.headingDeg === 'number'
+    ? raw.headingDeg
+    : 0;
+
+  const verticalRateFpm = typeof raw.baro_rate === 'number'
+    ? raw.baro_rate
+    : typeof raw.geom_rate === 'number'
+    ? raw.geom_rate
+    : typeof raw.verticalRateFpm === 'number'
+    ? raw.verticalRateFpm
+    : 0;
+
+  const elevationAngleDeg = calculateElevationAngleDeg(distKm, altitudeFt);
+  const cpaMin = calculateCpaMinutes(userLat, userLon, raw.lat, raw.lon, headingDeg, speedKts);
+
+  const airlineInfo = lookupAirline(ident);
+  const aircraftTypeCode = (raw.t || raw.aircraftType || '').trim().toUpperCase();
+  const aircraftInfo = lookupAircraft(aircraftTypeCode);
+
+  const origin = raw.origin || findNearestAirport(raw.lat, raw.lon);
+  const destination = raw.destination || getRandomAirport(origin.code);
+
+  const totalRouteDist = calculateDistanceKm(origin.lat, origin.lon, destination.lat, destination.lon);
+  const currentFromOrigin = calculateDistanceKm(origin.lat, origin.lon, raw.lat, raw.lon);
+  const progressPct = totalRouteDist > 0
+    ? Math.min(100, Math.max(5, Math.round((currentFromOrigin / totalRouteDist) * 100)))
+    : 50;
+
+  // Clean base URL for direct tar1090 link
+  const cleanBase = receiverBaseUrl.replace(/\/data\/.*$/, '').replace(/\/$/, '');
+  const tar1090Url = `${cleanBase}/?icao=${icao24}`;
+
+  return {
+    icao24,
+    ident,
+    registration: raw.r || raw.registration,
+    callsign: rawFlight ? `${airlineInfo.name.split(' ')[0]} ${rawFlight.replace(/\D/g, '') || rawFlight}` : 'Private Flight',
+    airline: airlineInfo.name,
+    airlineIcao: airlineInfo.icao,
+    lat: raw.lat,
+    lon: raw.lon,
+    altitudeFt: Math.round(altitudeFt),
+    altitudeM: Math.round(feetToMeters(altitudeFt)),
+    speedKts: Math.round(speedKts),
+    speedMph: Math.round(knotsToMph(speedKts)),
+    speedKmh: Math.round(knotsToKmh(speedKts)),
+    verticalRateFpm: Math.round(verticalRateFpm),
+    headingDeg: Math.round(headingDeg),
+    squawk: raw.squawk || '1200',
+    aircraftType: aircraftTypeCode || aircraftInfo.code,
+    aircraftModel: raw.desc || aircraftInfo.model,
+    aircraftCategory: aircraftInfo.category,
+    origin,
+    destination,
+    distanceKm: Math.round(distKm * 10) / 10,
+    distanceNm: Math.round(distNm * 10) / 10,
+    distanceMiles: Math.round(distMiles * 10) / 10,
+    bearingDeg: Math.round(bearingDeg),
+    cardinalDirection: cardinal,
+    elevationAngleDeg: Math.round(elevationAngleDeg * 10) / 10,
+    estimatedTimeToCpaMin: cpaMin,
+    routeProgressPct: progressPct,
+    source,
+    lastSeen: new Date().toISOString(),
+    rssi: typeof raw.rssi === 'number' ? Math.round(raw.rssi * 10) / 10 : undefined,
+    messages: typeof raw.messages === 'number' ? raw.messages : undefined,
+    seenSec: typeof raw.seen === 'number' ? Math.round(raw.seen * 10) / 10 : undefined,
+    tar1090Url,
+  };
+}
+
+// Fetch data from local tar1090 / readsb instance with auto-path discovery
+async function fetchLocalTar1090(
+  receiverUrl: string
+): Promise<{
+  aircraft: any[];
+  totalMessages?: number;
+  receiverLat?: number;
+  receiverLon?: number;
+  version?: string;
+  activeEndpoint: string;
+  latencyMs: number;
+} | null> {
+  const startTime = Date.now();
+  let base = receiverUrl.trim().replace(/\/$/, '');
+  if (!base.startsWith('http://') && !base.startsWith('https://')) {
+    base = `http://${base}`;
+  }
+
+  // Potential endpoints in tar1090 / readsb / dump1090-fa installations
+  const candidatePaths = base.endsWith('.json')
+    ? [base]
+    : [
+        detectedEndpointsCache.get(base),
+        `${base}/data/aircraft.json`,
+        `${base}/tar1090/data/aircraft.json`,
+        `${base}/dump1090-fa/data/aircraft.json`,
+        `${base}/readsb/data/aircraft.json`,
+        `${base}/aircraft.json`,
+      ].filter(Boolean) as string[];
+
+  let successfulEndpoint = '';
+  let payload: any = null;
+
+  for (const candidate of candidatePaths) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+
+      const res = await fetch(candidate, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data && (Array.isArray(data.aircraft) || Array.isArray(data))) {
+          successfulEndpoint = candidate;
+          payload = data;
+          detectedEndpointsCache.set(base, candidate);
+          break;
+        }
+      }
+    } catch {
+      // Continue trying next candidate
+    }
+  }
+
+  if (!payload || !successfulEndpoint) {
+    return null;
+  }
+
+  const latencyMs = Date.now() - startTime;
+  const aircraftList = Array.isArray(payload.aircraft) ? payload.aircraft : (Array.isArray(payload) ? payload : []);
+
+  // Check receiver.json for receiver coordinates if available
+  let receiverLat: number | undefined;
+  let receiverLon: number | undefined;
+  let version = payload.version;
+
+  const cachedConfig = receiverConfigCache.get(base);
+  if (cachedConfig) {
+    receiverLat = cachedConfig.lat;
+    receiverLon = cachedConfig.lon;
+    if (cachedConfig.version) version = cachedConfig.version;
+  } else {
+    try {
+      const receiverConfigUrl = successfulEndpoint.replace('aircraft.json', 'receiver.json');
+      const rRes = await fetch(receiverConfigUrl, { signal: AbortSignal.timeout(1000) });
+      if (rRes.ok) {
+        const rData = await rRes.json();
+        if (typeof rData.lat === 'number' && typeof rData.lon === 'number') {
+          receiverLat = rData.lat;
+          receiverLon = rData.lon;
+        }
+        if (rData.version) version = rData.version;
+        receiverConfigCache.set(base, { lat: receiverLat, lon: receiverLon, version });
+      }
+    } catch {
+      // Optional config file not found
+    }
+  }
+
+  return {
+    aircraft: aircraftList,
+    totalMessages: payload.messages,
+    receiverLat,
+    receiverLon,
+    version,
+    activeEndpoint: successfulEndpoint,
+    latencyMs,
+  };
+}
+
+// ---------------- API ROUTES ----------------
+
+// Receiver connection diagnostics endpoint
+app.get('/api/receiver/status', async (req: Request, res: Response) => {
+  const receiverUrl =
+    (req.query.receiverUrl as string) ||
+    (req.headers['x-receiver-url'] as string) ||
+    process.env.LOCAL_ADSB_URL ||
+    'http://localhost:8080';
+
+  const result = await fetchLocalTar1090(receiverUrl);
+
+  if (!result) {
+    return res.json({
+      connected: false,
+      url: receiverUrl,
+      latencyMs: 0,
+      aircraftCount: 0,
+      error: `Could not reach tar1090 receiver at ${receiverUrl}. Ensure your readsb or dump1090 service is active.`,
+    });
+  }
+
+  res.json({
+    connected: true,
+    url: receiverUrl,
+    activeEndpoint: result.activeEndpoint,
+    latencyMs: result.latencyMs,
+    aircraftCount: result.aircraft.length,
+    totalMessages: result.totalMessages,
+    version: result.version,
+    receiverLat: result.receiverLat,
+    receiverLon: result.receiverLon,
+  });
+});
+
+// Main aircraft radar query: local tar1090 prioritized
+app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
+  const latStr = req.query.lat as string;
+  const lonStr = req.query.lon as string;
+  const radiusStr = req.query.radius as string;
+  const receiverUrl =
+    (req.query.receiverUrl as string) ||
+    (req.headers['x-receiver-url'] as string) ||
+    process.env.LOCAL_ADSB_URL ||
+    'http://localhost:8080';
+
+  let userLat = parseFloat(latStr) || 37.7749;
+  let userLon = parseFloat(lonStr) || -122.4194;
+  const radiusNm = Math.min(300, Math.max(5, parseFloat(radiusStr) || 60));
+
+  let aircraftList: AircraftInfo[] = [];
+  let source: 'tar1090' | 'simulated' = 'simulated';
+  let activeProvider = 'Local tar1090 Receiver';
+  let statusMessage = '';
+  let receiverStatus: ReceiverStatus = {
+    connected: false,
+    url: receiverUrl,
+    latencyMs: 0,
+    aircraftCount: 0,
+  };
+
+  // 1. Query Local tar1090 / readsb instance
+  const tar1090Data = await fetchLocalTar1090(receiverUrl);
+
+  if (tar1090Data) {
+    receiverStatus = {
+      connected: true,
+      url: receiverUrl,
+      activeEndpoint: tar1090Data.activeEndpoint,
+      latencyMs: tar1090Data.latencyMs,
+      aircraftCount: tar1090Data.aircraft.length,
+      totalMessages: tar1090Data.totalMessages,
+      version: tar1090Data.version,
+      receiverLat: tar1090Data.receiverLat,
+      receiverLon: tar1090Data.receiverLon,
+    };
+
+    // If receiver reports its own antenna coordinates and client did not supply specific coords:
+    if (tar1090Data.receiverLat && tar1090Data.receiverLon && !req.query.lat) {
+      userLat = tar1090Data.receiverLat;
+      userLon = tar1090Data.receiverLon;
+    }
+
+    const processed = tar1090Data.aircraft
+      .map((raw) => processTar1090Aircraft(raw, userLat, userLon, receiverUrl, 'tar1090'))
+      .filter((ac): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+
+    if (processed.length > 0) {
+      aircraftList = processed;
+      source = 'tar1090';
+      activeProvider = `Local ADS-B (${receiverUrl})`;
+      statusMessage = `Receiving live RF transponder signals from ${aircraftList.length} aircraft via local tar1090 receiver (${tar1090Data.latencyMs}ms latency).`;
+    } else {
+      statusMessage = `Connected to local tar1090 receiver at ${receiverUrl}, but no airborne transponders with GPS coordinates currently within ${radiusNm} NM.`;
+    }
+  }
+
+  // 2. If local receiver is offline or zero aircraft in sector, fall back to simulated test fleet
+  if (aircraftList.length === 0) {
+    updateSimFleet(userLat, userLon);
+    aircraftList = simulatedFleet
+      .map((ac) => processTar1090Aircraft(ac, userLat, userLon, receiverUrl, 'simulated'))
+      .filter((ac): ac is AircraftInfo => ac !== null);
+    source = 'simulated';
+    activeProvider = `Airspace Simulation (Receiver Offline at ${receiverUrl})`;
+    if (!statusMessage) {
+      statusMessage = `Local receiver at ${receiverUrl} is offline. Displaying local airspace simulation with transponder metrics.`;
+    }
+  }
+
+  // Sort by distance to observer ascending
+  aircraftList.sort((a, b) => a.distanceNm - b.distanceNm);
+  const closest = aircraftList.length > 0 ? aircraftList[0] : null;
+
+  const response: RadarDataResponse = {
+    userLocation: {
+      lat: userLat,
+      lon: userLon,
+      isReceiverPosition: !!(receiverStatus.receiverLat && receiverStatus.receiverLat === userLat),
+    },
+    closestAircraft: closest,
+    allAircraft: aircraftList,
+    scanRadiusNm: radiusNm,
+    timestamp: new Date().toISOString(),
+    source,
+    activeProvider,
+    totalTracked: aircraftList.length,
+    statusMessage,
+    receiver: receiverStatus,
+  };
+
+  res.json(response);
+});
+
+// Vite & Static middleware
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.resolve(__dirname, 'dist')));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+    });
+  }
+
+  app.listen(PORT, () => {
+    console.log(`📡 AeroProximity Local tar1090 ADS-B Server running on port ${PORT}`);
+  });
+}
+
+startServer();
