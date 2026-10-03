@@ -29,9 +29,31 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+// Enable CORS and generous JSON parsing for live aircraft feeds
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-receiver-url');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
-// Simulation fleet for smooth visualization if receiver is currently offline
+app.use(express.json({ limit: '15mb' }));
+
+// In-memory feed for ingested / streamed tar1090 data (via curl bridge or client)
+interface IngestedFeed {
+  timestamp: number;
+  data: any;
+  receiverUrl: string;
+  source: 'tar1090-ingest' | 'tar1090-direct';
+  autoCentroid?: { lat: number; lon: number };
+}
+
+let latestIngestedFeed: IngestedFeed | null = null;
+
+// Simulation fleet for fallback
 interface SimAircraft {
   icao24: string;
   ident: string;
@@ -176,6 +198,23 @@ function updateSimFleet(userLat: number, userLon: number) {
   }
 }
 
+// Calculate centroid of aircraft coordinates
+function calculateAircraftCentroid(aircraftList: any[]): { lat: number; lon: number } | null {
+  const valid = aircraftList.filter((a) => typeof a.lat === 'number' && typeof a.lon === 'number');
+  if (valid.length === 0) return null;
+
+  let sumLat = 0;
+  let sumLon = 0;
+  for (const a of valid) {
+    sumLat += a.lat;
+    sumLon += a.lon;
+  }
+  return {
+    lat: Math.round((sumLat / valid.length) * 10000) / 10000,
+    lon: Math.round((sumLon / valid.length) * 10000) / 10000,
+  };
+}
+
 // Transform raw tar1090/readsb aircraft JSON item into AircraftInfo
 function processTar1090Aircraft(
   raw: any,
@@ -190,7 +229,7 @@ function processTar1090Aircraft(
 
   const icao24 = (raw.hex || raw.icao24 || '').toLowerCase().trim();
   const rawFlight = (raw.flight || raw.ident || '').trim().toUpperCase();
-  const ident = rawFlight || icao24.toUpperCase();
+  const ident = rawFlight || (raw.r ? raw.r.trim().toUpperCase() : icao24.toUpperCase());
 
   const distKm = calculateDistanceKm(userLat, userLon, raw.lat, raw.lon);
   const distNm = kmToNm(distKm);
@@ -198,13 +237,17 @@ function processTar1090Aircraft(
   const bearingDeg = calculateBearingDeg(userLat, userLon, raw.lat, raw.lon);
   const cardinal = bearingToCardinal(bearingDeg);
 
-  const altitudeFt = typeof raw.alt_baro === 'number'
-    ? raw.alt_baro
-    : typeof raw.alt_geom === 'number'
-    ? raw.alt_geom
-    : typeof raw.altitudeFt === 'number'
-    ? raw.altitudeFt
-    : 0;
+  // Altitude can be number, or 'ground'
+  let altitudeFt = 0;
+  if (typeof raw.alt_baro === 'number') {
+    altitudeFt = raw.alt_baro;
+  } else if (typeof raw.alt_geom === 'number') {
+    altitudeFt = raw.alt_geom;
+  } else if (typeof raw.altitudeFt === 'number') {
+    altitudeFt = raw.altitudeFt;
+  } else if (raw.alt_baro === 'ground') {
+    altitudeFt = 0;
+  }
 
   const speedKts = typeof raw.gs === 'number'
     ? raw.gs
@@ -243,14 +286,14 @@ function processTar1090Aircraft(
     : 50;
 
   // Clean base URL for direct tar1090 link
-  const cleanBase = receiverBaseUrl.replace(/\/data\/.*$/, '').replace(/\/$/, '');
+  const cleanBase = (receiverBaseUrl || 'http://localhost:8080').replace(/\/data\/.*$/, '').replace(/\/$/, '');
   const tar1090Url = `${cleanBase}/?icao=${icao24}`;
 
   return {
     icao24,
     ident,
     registration: raw.r || raw.registration,
-    callsign: rawFlight ? `${airlineInfo.name.split(' ')[0]} ${rawFlight.replace(/\D/g, '') || rawFlight}` : 'Private Flight',
+    callsign: rawFlight ? `${airlineInfo.name.split(' ')[0]} ${rawFlight.replace(/\D/g, '') || rawFlight}` : (raw.r ? `Tail ${raw.r}` : 'General Aviation'),
     airline: airlineInfo.name,
     airlineIcao: airlineInfo.icao,
     lat: raw.lat,
@@ -350,7 +393,6 @@ async function fetchLocalTar1090(
   const latencyMs = Date.now() - startTime;
   const aircraftList = Array.isArray(payload.aircraft) ? payload.aircraft : (Array.isArray(payload) ? payload : []);
 
-  // Check receiver.json for receiver coordinates if available
   let receiverLat: number | undefined;
   let receiverLon: number | undefined;
   let version = payload.version;
@@ -399,6 +441,27 @@ app.get('/api/receiver/status', async (req: Request, res: Response) => {
     process.env.LOCAL_ADSB_URL ||
     'http://localhost:8080';
 
+  // Check if we have recently ingested data via stream bridge
+  const isRecentIngest = latestIngestedFeed && Date.now() - latestIngestedFeed.timestamp < 30000;
+  if (isRecentIngest && latestIngestedFeed) {
+    const rawList = Array.isArray(latestIngestedFeed.data.aircraft)
+      ? latestIngestedFeed.data.aircraft
+      : (Array.isArray(latestIngestedFeed.data) ? latestIngestedFeed.data : []);
+
+    return res.json({
+      connected: true,
+      url: latestIngestedFeed.receiverUrl,
+      activeEndpoint: 'Live Stream Bridge / Ingested JSON',
+      latencyMs: 1,
+      aircraftCount: rawList.length,
+      totalMessages: latestIngestedFeed.data.messages,
+      version: latestIngestedFeed.data.version || 'readsb/tar1090',
+      receiverLat: latestIngestedFeed.autoCentroid?.lat,
+      receiverLon: latestIngestedFeed.autoCentroid?.lon,
+      isIngestedStream: true,
+    });
+  }
+
   const result = await fetchLocalTar1090(receiverUrl);
 
   if (!result) {
@@ -407,7 +470,7 @@ app.get('/api/receiver/status', async (req: Request, res: Response) => {
       url: receiverUrl,
       latencyMs: 0,
       aircraftCount: 0,
-      error: `Could not reach tar1090 receiver at ${receiverUrl}. Ensure your readsb or dump1090 service is active.`,
+      error: `Cloud server cannot reach ${receiverUrl} directly because it is on your private local network (LAN). Use the Browser Direct Mode or the 1-line stream bridge.`,
     });
   }
 
@@ -424,7 +487,71 @@ app.get('/api/receiver/status', async (req: Request, res: Response) => {
   });
 });
 
-// Main aircraft radar query: local tar1090 prioritized
+// Ingest endpoint: accepts JSON piped from curl, a local cron, or the browser directly
+app.post('/api/aircraft/ingest', (req: Request, res: Response) => {
+  const payload = req.body;
+  if (!payload) {
+    return res.status(400).json({ error: 'Empty JSON payload' });
+  }
+
+  const aircraftList = Array.isArray(payload.aircraft)
+    ? payload.aircraft
+    : (Array.isArray(payload) ? payload : []);
+
+  const receiverUrl =
+    (req.query.receiverUrl as string) ||
+    (req.headers['x-receiver-url'] as string) ||
+    'http://10.17.20.132:8080';
+
+  const centroid = calculateAircraftCentroid(aircraftList);
+
+  latestIngestedFeed = {
+    timestamp: Date.now(),
+    data: payload,
+    receiverUrl,
+    source: 'tar1090-ingest',
+    autoCentroid: centroid || undefined,
+  };
+
+  res.json({
+    success: true,
+    aircraftCount: aircraftList.length,
+    centroid,
+    message: `Successfully ingested ${aircraftList.length} aircraft from tar1090 live transponder feed.`,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Process raw aircraft JSON on demand with user location
+app.post('/api/aircraft/process', (req: Request, res: Response) => {
+  const { rawData, userLat = 37.7749, userLon = -122.4194, radiusNm = 60, receiverUrl = 'http://localhost:8080' } = req.body;
+
+  if (!rawData) {
+    return res.status(400).json({ error: 'rawData is required' });
+  }
+
+  const rawList = Array.isArray(rawData.aircraft)
+    ? rawData.aircraft
+    : (Array.isArray(rawData) ? rawData : []);
+
+  const processed = rawList
+    .map((raw: any) => processTar1090Aircraft(raw, userLat, userLon, receiverUrl, 'tar1090'))
+    .filter((ac: any): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+
+  processed.sort((a: any, b: any) => a.distanceNm - b.distanceNm);
+  const closest = processed.length > 0 ? processed[0] : null;
+
+  res.json({
+    userLocation: { lat: userLat, lon: userLon },
+    closestAircraft: closest,
+    allAircraft: processed,
+    scanRadiusNm: radiusNm,
+    totalTracked: processed.length,
+    source: 'tar1090',
+  });
+});
+
+// Main aircraft radar query: checks ingested stream first, then direct server query, then simulation
 app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
   const latStr = req.query.lat as string;
   const lonStr = req.query.lon as string;
@@ -433,7 +560,7 @@ app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
     (req.query.receiverUrl as string) ||
     (req.headers['x-receiver-url'] as string) ||
     process.env.LOCAL_ADSB_URL ||
-    'http://localhost:8080';
+    'http://10.17.20.132:8080';
 
   let userLat = parseFloat(latStr) || 37.7749;
   let userLon = parseFloat(lonStr) || -122.4194;
@@ -450,56 +577,94 @@ app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
     aircraftCount: 0,
   };
 
-  // 1. Query Local tar1090 / readsb instance
-  const tar1090Data = await fetchLocalTar1090(receiverUrl);
+  // 1. Check if we have active ingested stream from user (within last 35 seconds)
+  const isIngestedActive = latestIngestedFeed && Date.now() - latestIngestedFeed.timestamp < 35000;
 
-  if (tar1090Data) {
-    receiverStatus = {
-      connected: true,
-      url: receiverUrl,
-      activeEndpoint: tar1090Data.activeEndpoint,
-      latencyMs: tar1090Data.latencyMs,
-      aircraftCount: tar1090Data.aircraft.length,
-      totalMessages: tar1090Data.totalMessages,
-      version: tar1090Data.version,
-      receiverLat: tar1090Data.receiverLat,
-      receiverLon: tar1090Data.receiverLon,
-    };
+  if (isIngestedActive && latestIngestedFeed) {
+    const rawList = Array.isArray(latestIngestedFeed.data.aircraft)
+      ? latestIngestedFeed.data.aircraft
+      : (Array.isArray(latestIngestedFeed.data) ? latestIngestedFeed.data : []);
 
-    // If receiver reports its own antenna coordinates and client did not supply specific coords:
-    if (tar1090Data.receiverLat && tar1090Data.receiverLon && !req.query.lat) {
-      userLat = tar1090Data.receiverLat;
-      userLon = tar1090Data.receiverLon;
+    // If client requested default coordinates and we have a calculated centroid for their aircraft:
+    if (!req.query.lat && latestIngestedFeed.autoCentroid) {
+      userLat = latestIngestedFeed.autoCentroid.lat;
+      userLon = latestIngestedFeed.autoCentroid.lon;
     }
 
-    const processed = tar1090Data.aircraft
-      .map((raw) => processTar1090Aircraft(raw, userLat, userLon, receiverUrl, 'tar1090'))
-      .filter((ac): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+    receiverStatus = {
+      connected: true,
+      url: latestIngestedFeed.receiverUrl,
+      activeEndpoint: 'Live Stream Bridge / Ingested JSON',
+      latencyMs: 1,
+      aircraftCount: rawList.length,
+      totalMessages: latestIngestedFeed.data.messages,
+      version: latestIngestedFeed.data.version || 'readsb/tar1090',
+      receiverLat: latestIngestedFeed.autoCentroid?.lat,
+      receiverLon: latestIngestedFeed.autoCentroid?.lon,
+    };
+
+    const processed = rawList
+      .map((raw: any) => processTar1090Aircraft(raw, userLat, userLon, latestIngestedFeed!.receiverUrl, 'tar1090'))
+      .filter((ac: any): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
 
     if (processed.length > 0) {
       aircraftList = processed;
       source = 'tar1090';
-      activeProvider = `Local ADS-B (${receiverUrl})`;
-      statusMessage = `Receiving live RF transponder signals from ${aircraftList.length} aircraft via local tar1090 receiver (${tar1090Data.latencyMs}ms latency).`;
+      activeProvider = `Local ADS-B Stream (${latestIngestedFeed.receiverUrl})`;
+      statusMessage = `Receiving live transponder signals from ${aircraftList.length} aircraft via tar1090 stream.`;
     } else {
-      statusMessage = `Connected to local tar1090 receiver at ${receiverUrl}, but no airborne transponders with GPS coordinates currently within ${radiusNm} NM.`;
+      statusMessage = `Connected to tar1090 feed with ${rawList.length} aircraft, but none currently within ${radiusNm} NM of observer.`;
     }
   }
 
-  // 2. If local receiver is offline or zero aircraft in sector, fall back to simulated test fleet
+  // 2. If no ingested stream, attempt direct server fetch (works if running locally or accessible via domain/tunnel)
+  if (aircraftList.length === 0) {
+    const tar1090Data = await fetchLocalTar1090(receiverUrl);
+
+    if (tar1090Data) {
+      receiverStatus = {
+        connected: true,
+        url: receiverUrl,
+        activeEndpoint: tar1090Data.activeEndpoint,
+        latencyMs: tar1090Data.latencyMs,
+        aircraftCount: tar1090Data.aircraft.length,
+        totalMessages: tar1090Data.totalMessages,
+        version: tar1090Data.version,
+        receiverLat: tar1090Data.receiverLat,
+        receiverLon: tar1090Data.receiverLon,
+      };
+
+      if (tar1090Data.receiverLat && tar1090Data.receiverLon && !req.query.lat) {
+        userLat = tar1090Data.receiverLat;
+        userLon = tar1090Data.receiverLon;
+      }
+
+      const processed = tar1090Data.aircraft
+        .map((raw) => processTar1090Aircraft(raw, userLat, userLon, receiverUrl, 'tar1090'))
+        .filter((ac): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+
+      if (processed.length > 0) {
+        aircraftList = processed;
+        source = 'tar1090';
+        activeProvider = `Local ADS-B (${receiverUrl})`;
+        statusMessage = `Receiving live transponder signals from ${aircraftList.length} aircraft via local tar1090 receiver.`;
+      }
+    }
+  }
+
+  // 3. Fallback: Airspace simulation with clear diagnostic notice
   if (aircraftList.length === 0) {
     updateSimFleet(userLat, userLon);
     aircraftList = simulatedFleet
       .map((ac) => processTar1090Aircraft(ac, userLat, userLon, receiverUrl, 'simulated'))
       .filter((ac): ac is AircraftInfo => ac !== null);
     source = 'simulated';
-    activeProvider = `Airspace Simulation (Receiver Offline at ${receiverUrl})`;
+    activeProvider = `Simulation (Receiver at ${receiverUrl} not yet bridged)`;
     if (!statusMessage) {
-      statusMessage = `Local receiver at ${receiverUrl} is offline. Displaying local airspace simulation with transponder metrics.`;
+      statusMessage = `Local receiver at ${receiverUrl} is on private LAN. Use Browser Direct Mode, 1-line stream bridge, or paste JSON to link radio.`;
     }
   }
 
-  // Sort by distance to observer ascending
   aircraftList.sort((a, b) => a.distanceNm - b.distanceNm);
   const closest = aircraftList.length > 0 ? aircraftList[0] : null;
 

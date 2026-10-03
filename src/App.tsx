@@ -7,7 +7,7 @@ import { SectorAircraftTable } from './components/SectorAircraftTable.tsx';
 import { LocalAdsbSettingsModal } from './components/LocalAdsbSettingsModal.tsx';
 import { RadarDataResponse, AircraftInfo } from './types/aviation.js';
 import { radarAudio } from './utils/audio.ts';
-import { Antenna, MapPin, AlertCircle, Radio, Activity, ExternalLink } from 'lucide-react';
+import { Antenna, MapPin, AlertCircle, Terminal, Radio } from 'lucide-react';
 
 export default function App() {
   // Navigation & View state
@@ -22,11 +22,11 @@ export default function App() {
     name: 'San Francisco (SFO)',
   });
   const [isLocating, setIsLocating] = useState(false);
-  const [radiusNm, setRadiusNm] = useState(40);
+  const [radiusNm, setRadiusNm] = useState(60);
 
-  // Local tar1090 receiver URL (defaults to http://localhost:8080)
+  // Local tar1090 receiver URL (defaults to user's specified http://10.17.20.132:8080)
   const [receiverUrl, setReceiverUrl] = useState<string>(() => {
-    return localStorage.getItem('local_adsb_url') || 'http://localhost:8080';
+    return localStorage.getItem('local_adsb_url') || 'http://10.17.20.132:8080';
   });
 
   // Telemetry data
@@ -37,10 +37,41 @@ export default function App() {
 
   const prevClosestIdentRef = useRef<string | null>(null);
 
+  // Attempt direct browser fetch of local receiver (in case browser is allowed to access LAN HTTP)
+  const attemptBrowserDirectFetch = useCallback(async () => {
+    try {
+      let target = receiverUrl.trim().replace(/\/$/, '');
+      if (!target.endsWith('.json')) target = `${target}/data/aircraft.json`;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+
+      const res = await fetch(target, { mode: 'cors', signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (res.ok) {
+        const json = await res.json();
+        if (json && (Array.isArray(json.aircraft) || Array.isArray(json))) {
+          // Push directly to ingest endpoint
+          await fetch('/api/aircraft/ingest', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(json),
+          });
+        }
+      }
+    } catch {
+      // Browser blocked by Mixed Content or unreachable
+    }
+  }, [receiverUrl]);
+
   // Fetch live closest airplane data from local tar1090 receiver via our backend
   const fetchRadarData = useCallback(async (showLoading = false) => {
     if (showLoading) setIsLoading(true);
     try {
+      // Run browser direct attempt first
+      attemptBrowserDirectFetch();
+
       const params = new URLSearchParams({
         lat: userLocation.lat.toString(),
         lon: userLocation.lon.toString(),
@@ -57,6 +88,15 @@ export default function App() {
       setRadarData(data);
       setErrorMsg(null);
 
+      // Auto-update user radar center if backend detected antenna centroid and user is on default
+      if (data.userLocation.lat && data.userLocation.isReceiverPosition && userLocation.name === 'San Francisco (SFO)') {
+        setUserLocation({
+          lat: data.userLocation.lat,
+          lon: data.userLocation.lon,
+          name: 'Receiver Antenna Sector',
+        });
+      }
+
       // Play audio chirp when closest aircraft changes or locks in
       if (data.closestAircraft) {
         if (prevClosestIdentRef.current !== data.closestAircraft.ident) {
@@ -72,7 +112,34 @@ export default function App() {
     } finally {
       if (showLoading) setIsLoading(false);
     }
-  }, [userLocation.lat, userLocation.lon, radiusNm, receiverUrl]);
+  }, [userLocation.lat, userLocation.lon, radiusNm, receiverUrl, attemptBrowserDirectFetch]);
+
+  // Handle direct JSON ingestion (from paste tab or bridge)
+  const handleIngestJson = async (jsonString: string): Promise<boolean> => {
+    try {
+      const parsed = JSON.parse(jsonString);
+      const res = await fetch('/api/aircraft/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed),
+      });
+      if (res.ok) {
+        const ingestData = await res.json();
+        if (ingestData.centroid) {
+          setUserLocation({
+            lat: ingestData.centroid.lat,
+            lon: ingestData.centroid.lon,
+            name: 'Radio Antenna Sector',
+          });
+        }
+        await fetchRadarData(true);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
 
   // Request browser geolocation
   const handleRequestGeolocation = () => {
@@ -128,7 +195,7 @@ export default function App() {
     fetchRadarData(true);
   }, [fetchRadarData]);
 
-  // Real-time polling loop (every 2.5 seconds for snappy local ADS-B reception)
+  // Real-time polling loop (every 2.5 seconds)
   useEffect(() => {
     const timer = setInterval(() => {
       fetchRadarData(false);
@@ -204,31 +271,34 @@ export default function App() {
                   isConnected ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]' : 'bg-amber-400 animate-pulse'
                 }`}
               />
-              <span className="text-slate-300">{receiverUrl}</span>
-              {radarData?.receiver.latencyMs ? (
-                <span className="text-slate-500">({radarData.receiver.latencyMs}ms)</span>
-              ) : null}
+              <span className="text-slate-300 font-mono">{receiverUrl}</span>
+              {isConnected ? (
+                <span className="text-emerald-400 font-semibold">[LIVE]</span>
+              ) : (
+                <span className="text-amber-400">[LAN BRIDGE REQUIRED]</span>
+              )}
             </button>
           </div>
         </div>
       </div>
 
-      {/* Receiver Connection Notification if offline */}
+      {/* Receiver Connection Notification if on private LAN and not yet bridged */}
       {!isConnected && (
-        <div className="border-b border-amber-900/50 bg-amber-950/20 px-4 sm:px-6 py-2 text-xs text-amber-300 flex items-center justify-between">
-          <div className="max-w-7xl mx-auto w-full flex items-center justify-between gap-3">
+        <div className="border-b border-cyan-900/50 bg-cyan-950/20 px-4 sm:px-6 py-2.5 text-xs text-cyan-300">
+          <div className="max-w-7xl mx-auto w-full flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <Antenna className="w-4 h-4 text-amber-400 shrink-0" />
+              <Antenna className="w-4 h-4 text-cyan-400 shrink-0" />
               <span>
-                Local tar1090 receiver at <strong className="font-mono">{receiverUrl}</strong> is not responding. Showing simulated traffic.
+                Your ADS-B radio is active at <strong className="font-mono text-white">{receiverUrl}</strong>! Since this app runs in cloud HTTPS, link your stream with 1 terminal command or paste JSON.
               </span>
             </div>
             <button
               type="button"
               onClick={() => setIsSettingsOpen(true)}
-              className="underline hover:text-amber-100 font-medium shrink-0"
+              className="inline-flex items-center gap-1 px-3 py-1 bg-cyan-600 hover:bg-cyan-500 text-white rounded text-xs font-medium transition-colors shrink-0 self-start sm:self-auto"
             >
-              Configure Receiver
+              <Terminal className="w-3.5 h-3.5" />
+              <span>Bridge Radio / Paste JSON</span>
             </button>
           </div>
         </div>
@@ -318,6 +388,7 @@ export default function App() {
         onRequestGeolocation={handleRequestGeolocation}
         isLocating={isLocating}
         currentReceiverStatus={radarData?.receiver}
+        onIngestJson={handleIngestJson}
       />
 
       {/* Quiet, Clean Editorial Footer */}
@@ -330,16 +401,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4 text-slate-400">
-            <span>Integrated with tar1090 / readsb / dump1090</span>
-            <a
-              href="https://github.com/wiedehopf/tar1090"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-cyan-400 hover:underline inline-flex items-center gap-1"
-            >
-              <span>tar1090 GitHub</span>
-              <ExternalLink className="w-3 h-3" />
-            </a>
+            <span>tar1090 / readsb Mode-S SDR Integration</span>
           </div>
         </div>
       </footer>
