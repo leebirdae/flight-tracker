@@ -22,6 +22,16 @@ export const AviationMap: React.FC<AviationMapProps> = ({
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+
+  // Helper to build CartoDB tile URL with optional API key
+  const getTileUrl = (apiKey?: string) => {
+    const cleanKey = (apiKey || '').trim();
+    if (cleanKey) {
+      return `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?api_key=${encodeURIComponent(cleanKey)}`;
+    }
+    return 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+  };
 
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
@@ -31,14 +41,35 @@ export const AviationMap: React.FC<AviationMapProps> = ({
       center: [userLocation.lat, userLocation.lon],
       zoom: 9,
       zoomControl: true,
-      attributionControl: false,
+      attributionControl: true,
     });
 
-    // Dark CartoDB tiles for avionics tactical map look
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    // Check for compile-time or client environment variable
+    const initialApiKey = (import.meta.env.VITE_CARTODB_API_KEY as string | undefined) || '';
+    const initialUrl = getTileUrl(initialApiKey);
+
+    // Dark CartoDB basemap tiles for avionics tactical look
+    const tileLayer = L.tileLayer(initialUrl, {
       maxZoom: 19,
       subdomains: 'abcd',
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>',
     }).addTo(map);
+
+    tileLayerRef.current = tileLayer;
+
+    // Also fetch runtime .env CARTODB_API_KEY from server /api/config
+    fetch('/api/config')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((cfg) => {
+        if (cfg?.cartodbApiKey && cfg.cartodbApiKey.trim() !== initialApiKey.trim()) {
+          const runtimeUrl = getTileUrl(cfg.cartodbApiKey);
+          tileLayer.setUrl(runtimeUrl);
+        }
+      })
+      .catch(() => {
+        // Fallback to default public basemap
+      });
 
     const layerGroup = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;

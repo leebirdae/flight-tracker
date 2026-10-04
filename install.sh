@@ -71,7 +71,7 @@ echo -e "${CYAN}==> [4/5] Installing application dependencies...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-npm install
+npm install --legacy-peer-deps || npm install
 
 # 5. Build Production Frontend Bundle
 echo -e "${CYAN}==> [5/5] Compiling application production assets...${NC}"
@@ -87,6 +87,10 @@ PORT=3000
 # URL of your local tar1090 / readsb / dump1090-fa instance
 # Examples: http://localhost:8080, http://10.17.20.132:8080, http://adsb.local:8080
 LOCAL_ADSB_URL=http://localhost:8080
+
+# CartoDB Basemap API Key (optional for public tiles, required for high-volume or private Carto tiers)
+CARTODB_API_KEY=""
+VITE_CARTODB_API_KEY=""
 EOF
   echo -e "${GREEN}✓ Generated default .env file.${NC}"
 fi

@@ -109,6 +109,9 @@ LOCAL_ADSB_URL=http://localhost:8080
 # LOCAL_ADSB_URL=http://10.17.20.132:8080
 # LOCAL_ADSB_URL=http://192.168.1.100:8080
 # LOCAL_ADSB_URL=http://adsb.local:8080
+
+# CartoDB Basemap API Key (optional for public tiles, required for high-volume or private Carto tiers)
+CARTODB_API_KEY=your_cartodb_api_key_here
 ```
 
 *Note: You can also change the receiver URL on the fly inside the web app by clicking the **tar1090 Receiver** button in the top navigation bar.*

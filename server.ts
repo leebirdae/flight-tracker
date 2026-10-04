@@ -479,6 +479,19 @@ async function fetchLocalTar1090(
 
 // ---------------- API ROUTES ----------------
 
+// Public client configuration (CartoDB API key, local receiver default)
+app.get('/api/config', (_req: Request, res: Response) => {
+  const cartodbApiKey =
+    process.env.CARTODB_API_KEY ||
+    process.env.VITE_CARTODB_API_KEY ||
+    '';
+
+  res.json({
+    cartodbApiKey,
+    localAdsbUrl: process.env.LOCAL_ADSB_URL || 'http://localhost:8080',
+  });
+});
+
 // Receiver connection diagnostics endpoint
 app.get('/api/receiver/status', async (req: Request, res: Response) => {
   const receiverUrl =
