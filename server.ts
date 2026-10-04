@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import {
@@ -387,49 +388,109 @@ async function fetchLocalTar1090(
   latencyMs: number;
 } | null> {
   const startTime = Date.now();
-  let base = receiverUrl.trim().replace(/\/$/, '');
+  const cleanInput = receiverUrl.trim();
+
+  // 1. Direct local filesystem check (e.g. /run/readsb/aircraft.json in container/host)
+  if (cleanInput.startsWith('/') || cleanInput.startsWith('file://')) {
+    const filePath = cleanInput.replace(/^file:\/\//, '');
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = await fs.promises.readFile(filePath, 'utf-8');
+        const data = JSON.parse(raw);
+        if (data && (Array.isArray(data.aircraft) || Array.isArray(data))) {
+          const aircraftList = Array.isArray(data.aircraft) ? data.aircraft : (Array.isArray(data) ? data : []);
+          return {
+            aircraft: aircraftList,
+            totalMessages: data.messages,
+            receiverLat: typeof data.lat === 'number' ? data.lat : undefined,
+            receiverLon: typeof data.lon === 'number' ? data.lon : undefined,
+            version: data.version || 'readsb/dump1090 (local file)',
+            activeEndpoint: filePath,
+            latencyMs: Date.now() - startTime,
+          };
+        }
+      }
+    } catch {
+      // Local file unreadable or invalid JSON
+    }
+  }
+
+  // 2. Network HTTP/HTTPS fetch
+  let base = cleanInput.replace(/\/$/, '');
   if (!base.startsWith('http://') && !base.startsWith('https://')) {
     base = `http://${base}`;
   }
 
-  // Potential endpoints in tar1090 / readsb / dump1090-fa installations
-  const candidatePaths = base.endsWith('.json')
-    ? [base]
-    : [
-        detectedEndpointsCache.get(base),
-        `${base}/data/aircraft.json`,
-        `${base}/tar1090/data/aircraft.json`,
-        `${base}/dump1090-fa/data/aircraft.json`,
-        `${base}/readsb/data/aircraft.json`,
-        `${base}/aircraft.json`,
-      ].filter(Boolean) as string[];
-
-  let successfulEndpoint = '';
-  let payload: any = null;
-
-  for (const candidate of candidatePaths) {
+  const urlObj = (() => {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 750);
+      return new URL(base);
+    } catch {
+      return null;
+    }
+  })();
 
-      const res = await fetch(candidate, {
+  const candidatePaths: string[] = [];
+  const cachedSuccess = detectedEndpointsCache.get(base);
+  if (cachedSuccess) {
+    candidatePaths.push(cachedSuccess);
+  }
+
+  if (base.endsWith('.json')) {
+    candidatePaths.push(base);
+  } else {
+    candidatePaths.push(
+      `${base}/data/aircraft.json`,
+      `${base}/tar1090/data/aircraft.json`,
+      `${base}/dump1090-fa/data/aircraft.json`,
+      `${base}/readsb/data/aircraft.json`,
+      `${base}/aircraft.json`
+    );
+    // If port was omitted, also test standard port 8080
+    if (urlObj && !urlObj.port) {
+      const port8080 = `${urlObj.protocol}//${urlObj.hostname}:8080`;
+      candidatePaths.push(
+        `${port8080}/data/aircraft.json`,
+        `${port8080}/tar1090/data/aircraft.json`,
+        `${port8080}/dump1090-fa/data/aircraft.json`,
+        `${port8080}/readsb/data/aircraft.json`,
+        `${port8080}/aircraft.json`
+      );
+    }
+  }
+
+  const fetchEndpoint = async (url: string) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    try {
+      const res = await fetch(url, {
         headers: { Accept: 'application/json' },
         signal: controller.signal,
       });
       clearTimeout(timeout);
-
       if (res.ok) {
         const data = await res.json();
         if (data && (Array.isArray(data.aircraft) || Array.isArray(data))) {
-          successfulEndpoint = candidate;
-          payload = data;
-          detectedEndpointsCache.set(base, candidate);
-          break;
+          return { endpoint: url, payload: data };
         }
       }
     } catch {
-      // Continue trying next candidate or bail fast
+      // not available
+    } finally {
+      clearTimeout(timeout);
     }
+    throw new Error('Endpoint not responding');
+  };
+
+  let successfulEndpoint = '';
+  let payload: any = null;
+
+  try {
+    const winner = await Promise.any(candidatePaths.map(fetchEndpoint));
+    successfulEndpoint = winner.endpoint;
+    payload = winner.payload;
+    detectedEndpointsCache.set(base, winner.endpoint);
+  } catch {
+    // None succeeded
   }
 
   if (!payload || !successfulEndpoint) {
@@ -439,19 +500,19 @@ async function fetchLocalTar1090(
   const latencyMs = Date.now() - startTime;
   const aircraftList = Array.isArray(payload.aircraft) ? payload.aircraft : (Array.isArray(payload) ? payload : []);
 
-  let receiverLat: number | undefined;
-  let receiverLon: number | undefined;
+  let receiverLat: number | undefined = typeof payload.lat === 'number' ? payload.lat : undefined;
+  let receiverLon: number | undefined = typeof payload.lon === 'number' ? payload.lon : undefined;
   let version = payload.version;
 
   const cachedConfig = receiverConfigCache.get(base);
   if (cachedConfig) {
-    receiverLat = cachedConfig.lat;
-    receiverLon = cachedConfig.lon;
+    if (typeof cachedConfig.lat === 'number') receiverLat = cachedConfig.lat;
+    if (typeof cachedConfig.lon === 'number') receiverLon = cachedConfig.lon;
     if (cachedConfig.version) version = cachedConfig.version;
   } else {
     try {
       const receiverConfigUrl = successfulEndpoint.replace('aircraft.json', 'receiver.json');
-      const rRes = await fetch(receiverConfigUrl, { signal: AbortSignal.timeout(1000) });
+      const rRes = await fetch(receiverConfigUrl, { signal: AbortSignal.timeout(1500) });
       if (rRes.ok) {
         const rData = await rRes.json();
         if (typeof rData.lat === 'number' && typeof rData.lon === 'number') {
@@ -500,8 +561,25 @@ app.get('/api/receiver/status', async (req: Request, res: Response) => {
     process.env.LOCAL_ADSB_URL ||
     'http://localhost:8080';
 
-  // Check if we have recently ingested data via stream bridge
-  const isRecentIngest = latestIngestedFeed && Date.now() - latestIngestedFeed.timestamp < 30000;
+  // 1. Check DIRECT connection to the local receiver first
+  const directResult = await fetchLocalTar1090(receiverUrl);
+  if (directResult) {
+    return res.json({
+      connected: true,
+      url: receiverUrl,
+      activeEndpoint: directResult.activeEndpoint,
+      latencyMs: directResult.latencyMs,
+      aircraftCount: directResult.aircraft.length,
+      totalMessages: directResult.totalMessages,
+      version: directResult.version,
+      receiverLat: directResult.receiverLat,
+      receiverLon: directResult.receiverLon,
+      isDirectConnection: true,
+    });
+  }
+
+  // 2. Check if we have recently ingested data via stream bridge (fallback for remote cloud)
+  const isRecentIngest = latestIngestedFeed && Date.now() - latestIngestedFeed.timestamp < 35000;
   if (isRecentIngest && latestIngestedFeed) {
     const rawList = Array.isArray(latestIngestedFeed.data.aircraft)
       ? latestIngestedFeed.data.aircraft
@@ -521,28 +599,13 @@ app.get('/api/receiver/status', async (req: Request, res: Response) => {
     });
   }
 
-  const result = await fetchLocalTar1090(receiverUrl);
-
-  if (!result) {
-    return res.json({
-      connected: false,
-      url: receiverUrl,
-      latencyMs: 0,
-      aircraftCount: 0,
-      error: `Cloud server cannot reach ${receiverUrl} directly because it is on your private local network (LAN). Use the Browser Direct Mode or the 1-line stream bridge.`,
-    });
-  }
-
+  // 3. Not reachable directly or via stream
   res.json({
-    connected: true,
+    connected: false,
     url: receiverUrl,
-    activeEndpoint: result.activeEndpoint,
-    latencyMs: result.latencyMs,
-    aircraftCount: result.aircraft.length,
-    totalMessages: result.totalMessages,
-    version: result.version,
-    receiverLat: result.receiverLat,
-    receiverLon: result.receiverLon,
+    latencyMs: 0,
+    aircraftCount: 0,
+    error: `Could not reach ${receiverUrl}. Ensure your local tar1090 / readsb / dump1090 receiver is running.`,
   });
 });
 
@@ -610,7 +673,7 @@ app.post('/api/aircraft/process', (req: Request, res: Response) => {
   });
 });
 
-// Main aircraft radar query: checks ingested stream first, then direct server query, then simulation
+// Main aircraft radar query: checks direct local ADS-B first, then ingested stream, then simulation
 app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
   const latStr = req.query.lat as string;
   const lonStr = req.query.lon as string;
@@ -627,7 +690,7 @@ app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
 
   let aircraftList: AircraftInfo[] = [];
   let source: 'tar1090' | 'simulated' = 'simulated';
-  let activeProvider = 'Local tar1090 Receiver';
+  let activeProvider = 'Local ADS-B Receiver';
   let statusMessage = '';
   let receiverStatus: ReceiverStatus = {
     connected: false,
@@ -636,92 +699,105 @@ app.get('/api/aircraft/closest', async (req: Request, res: Response) => {
     aircraftCount: 0,
   };
 
-  // 1. Check if we have active ingested stream from user (within last 35 seconds)
-  const isIngestedActive = latestIngestedFeed && Date.now() - latestIngestedFeed.timestamp < 35000;
+  // 1. Direct local ADS-B query (PRIORITY 1: if server can reach radio locally or via LAN, read directly!)
+  const directData = await fetchLocalTar1090(receiverUrl);
 
-  if (isIngestedActive && latestIngestedFeed) {
-    const rawList = Array.isArray(latestIngestedFeed.data.aircraft)
-      ? latestIngestedFeed.data.aircraft
-      : (Array.isArray(latestIngestedFeed.data) ? latestIngestedFeed.data : []);
-
-    // If client requested default coordinates and we have a calculated centroid for their aircraft:
-    if (!req.query.lat && latestIngestedFeed.autoCentroid) {
-      userLat = latestIngestedFeed.autoCentroid.lat;
-      userLon = latestIngestedFeed.autoCentroid.lon;
-    }
-
+  if (directData) {
     receiverStatus = {
       connected: true,
-      url: latestIngestedFeed.receiverUrl,
-      activeEndpoint: 'Live Stream Bridge / Ingested JSON',
-      latencyMs: 1,
-      aircraftCount: rawList.length,
-      totalMessages: latestIngestedFeed.data.messages,
-      version: latestIngestedFeed.data.version || 'readsb/tar1090',
-      receiverLat: latestIngestedFeed.autoCentroid?.lat,
-      receiverLon: latestIngestedFeed.autoCentroid?.lon,
+      url: receiverUrl,
+      activeEndpoint: directData.activeEndpoint,
+      latencyMs: directData.latencyMs,
+      aircraftCount: directData.aircraft.length,
+      totalMessages: directData.totalMessages,
+      version: directData.version,
+      receiverLat: directData.receiverLat,
+      receiverLon: directData.receiverLon,
     };
 
-    const processed = rawList
-      .map((raw: any) => processTar1090Aircraft(raw, userLat, userLon, latestIngestedFeed!.receiverUrl, 'tar1090'))
-      .filter((ac: any): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+    // Auto-center on antenna location if available
+    if (directData.receiverLat && directData.receiverLon && !req.query.lat) {
+      userLat = directData.receiverLat;
+      userLon = directData.receiverLon;
+    } else if (!req.query.lat && directData.aircraft.length > 0) {
+      // If receiver coordinates not in receiver.json, auto-center on centroid of tracked aircraft
+      const centroid = calculateAircraftCentroid(directData.aircraft);
+      if (centroid) {
+        userLat = centroid.lat;
+        userLon = centroid.lon;
+        receiverStatus.receiverLat = centroid.lat;
+        receiverStatus.receiverLon = centroid.lon;
+      }
+    }
+
+    const processed = directData.aircraft
+      .map((raw) => processTar1090Aircraft(raw, userLat, userLon, receiverUrl, 'tar1090'))
+      .filter((ac): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+
+    source = 'tar1090';
+    activeProvider = `Local ADS-B (Direct: ${receiverUrl})`;
 
     if (processed.length > 0) {
       aircraftList = processed;
-      source = 'tar1090';
-      activeProvider = `Local ADS-B Stream (${latestIngestedFeed.receiverUrl})`;
-      statusMessage = `Receiving live transponder signals from ${aircraftList.length} aircraft via tar1090 stream.`;
+      statusMessage = `Direct local connection: Tracking ${aircraftList.length} aircraft via ${directData.activeEndpoint}.`;
     } else {
-      statusMessage = `Connected to tar1090 feed with ${rawList.length} aircraft, but none currently within ${radiusNm} NM of observer.`;
+      aircraftList = [];
+      statusMessage = `Direct local connection active: ${directData.aircraft.length} aircraft tracked by antenna (0 currently within ${radiusNm} NM).`;
     }
   }
 
-  // 2. If no ingested stream, attempt direct server fetch (works if running locally or accessible via domain/tunnel)
-  if (aircraftList.length === 0) {
-    const tar1090Data = await fetchLocalTar1090(receiverUrl);
+  // 2. If direct fetch was not reachable, check if user has active stream bridge from remote container
+  if (!directData) {
+    const isIngestedActive = latestIngestedFeed && Date.now() - latestIngestedFeed.timestamp < 35000;
 
-    if (tar1090Data) {
-      receiverStatus = {
-        connected: true,
-        url: receiverUrl,
-        activeEndpoint: tar1090Data.activeEndpoint,
-        latencyMs: tar1090Data.latencyMs,
-        aircraftCount: tar1090Data.aircraft.length,
-        totalMessages: tar1090Data.totalMessages,
-        version: tar1090Data.version,
-        receiverLat: tar1090Data.receiverLat,
-        receiverLon: tar1090Data.receiverLon,
-      };
+    if (isIngestedActive && latestIngestedFeed) {
+      const rawList = Array.isArray(latestIngestedFeed.data.aircraft)
+        ? latestIngestedFeed.data.aircraft
+        : (Array.isArray(latestIngestedFeed.data) ? latestIngestedFeed.data : []);
 
-      if (tar1090Data.receiverLat && tar1090Data.receiverLon && !req.query.lat) {
-        userLat = tar1090Data.receiverLat;
-        userLon = tar1090Data.receiverLon;
+      if (!req.query.lat && latestIngestedFeed.autoCentroid) {
+        userLat = latestIngestedFeed.autoCentroid.lat;
+        userLon = latestIngestedFeed.autoCentroid.lon;
       }
 
-      const processed = tar1090Data.aircraft
-        .map((raw) => processTar1090Aircraft(raw, userLat, userLon, receiverUrl, 'tar1090'))
-        .filter((ac): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+      receiverStatus = {
+        connected: true,
+        url: latestIngestedFeed.receiverUrl,
+        activeEndpoint: 'Live Stream Bridge / Ingested JSON',
+        latencyMs: 1,
+        aircraftCount: rawList.length,
+        totalMessages: latestIngestedFeed.data.messages,
+        version: latestIngestedFeed.data.version || 'readsb/tar1090',
+        receiverLat: latestIngestedFeed.autoCentroid?.lat,
+        receiverLon: latestIngestedFeed.autoCentroid?.lon,
+      };
+
+      const processed = rawList
+        .map((raw: any) => processTar1090Aircraft(raw, userLat, userLon, latestIngestedFeed!.receiverUrl, 'tar1090'))
+        .filter((ac: any): ac is AircraftInfo => ac !== null && ac.distanceNm <= radiusNm);
+
+      source = 'tar1090';
+      activeProvider = `Local ADS-B Stream (${latestIngestedFeed.receiverUrl})`;
 
       if (processed.length > 0) {
         aircraftList = processed;
-        source = 'tar1090';
-        activeProvider = `Local ADS-B (${receiverUrl})`;
-        statusMessage = `Receiving live transponder signals from ${aircraftList.length} aircraft via local tar1090 receiver.`;
+        statusMessage = `Receiving live transponder signals from ${aircraftList.length} aircraft via tar1090 stream.`;
+      } else {
+        aircraftList = [];
+        statusMessage = `Connected to tar1090 stream with ${rawList.length} aircraft, but none currently within ${radiusNm} NM of observer.`;
       }
     }
   }
 
-  // 3. Fallback: Airspace simulation with clear diagnostic notice
-  if (aircraftList.length === 0) {
+  // 3. Fallback: Airspace simulation ONLY if local receiver could not be reached AND no stream bridge exists
+  if (!directData && !receiverStatus.connected) {
     updateSimFleet(userLat, userLon);
     aircraftList = simulatedFleet
       .map((ac) => processTar1090Aircraft(ac, userLat, userLon, receiverUrl, 'simulated'))
       .filter((ac): ac is AircraftInfo => ac !== null);
     source = 'simulated';
-    activeProvider = `Simulation (Receiver at ${receiverUrl} not yet bridged)`;
-    if (!statusMessage) {
-      statusMessage = `Local receiver at ${receiverUrl} is on private LAN. Use Browser Direct Mode, 1-line stream bridge, or paste JSON to link radio.`;
-    }
+    activeProvider = `Simulation (Receiver at ${receiverUrl} unreachable)`;
+    statusMessage = `Could not reach ${receiverUrl} directly. Ensure readsb/tar1090 is running at this address.`;
   }
 
   aircraftList.sort((a, b) => a.distanceNm - b.distanceNm);

@@ -312,23 +312,18 @@ export const LocalAdsbSettingsModal: React.FC<LocalAdsbSettingsModalProps> = ({
               </div>
             </div>
 
-            {/* Browser Mixed Content Notice (Explaining LAN IP vs Cloud App) */}
+            {/* Direct Connection & Local LAN Notice */}
             <div className="p-3.5 bg-slate-950 rounded-xl border border-slate-800 text-xs text-slate-300">
               <div className="flex items-start gap-2.5">
-                <ShieldAlert className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 <div className="space-y-1">
-                  <div className="font-semibold text-white">Why does cloud app need a bridge to 10.17.20.132?</div>
+                  <div className="font-semibold text-white">Direct Local ADS-B Connection</div>
                   <p className="text-[11px] text-slate-400 leading-relaxed">
-                    <strong className="text-cyan-300 font-mono">10.17.20.132</strong> is a private local network (LAN) IP. The cloud server in GCP cannot route to your private home router. To link your live radio, you have two quick options:
+                    When running on your Debian container or local machine, AeroProximity directly reads <code className="text-cyan-300 font-mono">/data/aircraft.json</code> from your receiver (<strong className="text-cyan-300 font-mono">{urlInput}</strong>). No LAN bridge or curl stream is required!
                   </p>
-                  <ul className="list-disc list-inside text-[11px] text-slate-400 space-y-1 pt-1">
-                    <li>
-                      <strong className="text-white">Option A (Recommended):</strong> Use the <strong>Stream Bridge (1-Line)</strong> tab to stream your curl directly into this web app in real time!
-                    </li>
-                    <li>
-                      <strong className="text-white">Option B (Browser Direct):</strong> In Chrome, click the Tune icon left of the URL bar &rarr; <em>Site Settings</em> &rarr; set <em>Insecure content</em> to <em>Allow</em> &rarr; reload. Your browser will then fetch directly from your radio!
-                    </li>
-                  </ul>
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    <em>(The Remote Bridge tab is only needed if hosting on a remote cloud server that cannot route to your private home LAN).</em>
+                  </p>
                 </div>
               </div>
             </div>
@@ -346,12 +341,12 @@ export const LocalAdsbSettingsModal: React.FC<LocalAdsbSettingsModalProps> = ({
                   {activeStatus.connected ? (
                     <>
                       <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      <span>Connected to tar1090 ({activeStatus.latencyMs}ms latency)</span>
+                      <span>Connected Directly to ADS-B Receiver ({activeStatus.latencyMs}ms latency)</span>
                     </>
                   ) : (
                     <>
                       <AlertTriangle className="w-4 h-4 text-amber-400" />
-                      <span>Receiver at {activeStatus.url} is on private LAN</span>
+                      <span>Could not reach receiver at {activeStatus.url}</span>
                     </>
                   )}
                 </div>

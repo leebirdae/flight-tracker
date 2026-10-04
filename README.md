@@ -139,6 +139,23 @@ The web app will immediately detect the live stream, calculate the geographic ce
 
 ---
 
+## 🔄 Updating the Application (Container / Linux)
+
+To update AeroProximity to the latest release at any time:
+
+```bash
+cd flight-tracker # or your repo directory
+bash update.sh
+```
+
+The script will automatically:
+- Fetch and pull the latest code from GitHub.
+- Update any new dependencies (`npm install --legacy-peer-deps`).
+- Rebuild production client assets (`npm run build`).
+- Safely restart the `aeroproximity.service` (if systemd is active).
+
+---
+
 ## 🛠️ Service Management
 
 If you enabled the systemd service during installation:
