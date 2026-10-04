@@ -154,6 +154,47 @@ export const AviationMap: React.FC<AviationMapProps> = ({
       marker.on('click', () => onSelectAircraft(ac));
       marker.addTo(layerGroup);
     });
+
+    // 3. Historical trail polyline for selected / closest aircraft
+    const targetAircraft = selectedAircraft || closestAircraft;
+    if (targetAircraft && targetAircraft.trail && targetAircraft.trail.length > 0) {
+      const latLngs: [number, number][] = targetAircraft.trail.map((p) => [p.lat, p.lon]);
+
+      // Ensure the aircraft's current position is connected at the head
+      const lastPoint = targetAircraft.trail[targetAircraft.trail.length - 1];
+      if (Math.abs(lastPoint.lat - targetAircraft.lat) > 0.00008 || Math.abs(lastPoint.lon - targetAircraft.lon) > 0.00008) {
+        latLngs.push([targetAircraft.lat, targetAircraft.lon]);
+      }
+
+      if (latLngs.length >= 2) {
+        L.polyline(latLngs, {
+          color: '#06b6d4',
+          weight: 3,
+          opacity: 0.85,
+          dashArray: '5 4',
+          lineCap: 'round',
+          lineJoin: 'round',
+        }).addTo(layerGroup);
+      }
+
+      // Render historical breadcrumb dots with graduated fading
+      targetAircraft.trail.forEach((p, idx) => {
+        const progress = (idx + 1) / (targetAircraft.trail!.length + 1);
+        const opacity = 0.25 + progress * 0.65;
+        L.circleMarker([p.lat, p.lon], {
+          radius: 3.5,
+          color: '#0891b2',
+          fillColor: '#22d3ee',
+          fillOpacity: opacity,
+          weight: 1.5,
+        })
+          .bindTooltip(
+            `${targetAircraft.ident} Trail (${idx + 1}/5)${p.altitudeFt ? ` · ${p.altitudeFt.toLocaleString()} ft` : ''}`,
+            { className: 'bg-slate-900 text-cyan-300 font-mono text-[10px]' }
+          )
+          .addTo(layerGroup);
+      });
+    }
   }, [userLocation, closestAircraft, allAircraft, selectedAircraft, radiusNm]);
 
   return (

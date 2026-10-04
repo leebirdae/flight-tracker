@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { AircraftInfo } from '../types/aviation.js';
 import { AircraftVectorIcon } from './AircraftVectorIcon.tsx';
 import { ZoomIn, ZoomOut, Compass, Navigation } from 'lucide-react';
+import { calculateDistanceKm, kmToNm, calculateBearingDeg } from '../utils/geo.ts';
 
 interface RadarScopeProps {
   userLocation: { lat: number; lon: number };
@@ -14,6 +15,7 @@ interface RadarScopeProps {
 }
 
 export const RadarScope: React.FC<RadarScopeProps> = ({
+  userLocation,
   closestAircraft,
   allAircraft,
   selectedAircraft,
@@ -251,6 +253,70 @@ export const RadarScope: React.FC<RadarScopeProps> = ({
               );
             })()
           )}
+
+          {/* History Path Trail Polyline for Selected / Closest Aircraft */}
+          {(() => {
+            const targetAircraft = selectedAircraft || closestAircraft;
+            if (!targetAircraft || !targetAircraft.trail || targetAircraft.trail.length === 0) return null;
+
+            // Map each historical point in the trail to radar scope (x, y)
+            const historicalCoords = targetAircraft.trail.map((p) => {
+              const dKm = calculateDistanceKm(userLocation.lat, userLocation.lon, p.lat, p.lon);
+              const dNm = kmToNm(dKm);
+              const bDeg = calculateBearingDeg(userLocation.lat, userLocation.lon, p.lat, p.lon);
+              const bRad = ((bDeg - 90) * Math.PI) / 180;
+              const frac = Math.min(1.08, dNm / radiusNm);
+              return {
+                x: center + frac * scopeRadius * Math.cos(bRad),
+                y: center + frac * scopeRadius * Math.sin(bRad),
+              };
+            });
+
+            // Head of the trail is the current target position
+            const headBearingRad = ((targetAircraft.bearingDeg - 90) * Math.PI) / 180;
+            const headDistFrac = Math.min(1.08, targetAircraft.distanceNm / radiusNm);
+            const headCoord = {
+              x: center + headDistFrac * scopeRadius * Math.cos(headBearingRad),
+              y: center + headDistFrac * scopeRadius * Math.sin(headBearingRad),
+            };
+
+            const fullPolyline = [...historicalCoords, headCoord];
+
+            return (
+              <g className="pointer-events-none">
+                {/* Connecting Polyline */}
+                {fullPolyline.length >= 2 && (
+                  <polyline
+                    points={fullPolyline.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')}
+                    fill="none"
+                    stroke="#22d3ee"
+                    strokeWidth="2.5"
+                    strokeDasharray="4 2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    opacity="0.85"
+                  />
+                )}
+
+                {/* Historical position breadcrumbs */}
+                {historicalCoords.map((pt, idx) => {
+                  const progress = (idx + 1) / (historicalCoords.length + 1);
+                  const opacity = 0.25 + progress * 0.65;
+                  const r = 2 + progress * 1.5;
+                  return (
+                    <circle
+                      key={idx}
+                      cx={pt.x}
+                      cy={pt.y}
+                      r={r}
+                      fill="#22d3ee"
+                      opacity={opacity}
+                    />
+                  );
+                })}
+              </g>
+            );
+          })()}
 
           {/* Aircraft Blips and Data Tags */}
           {allAircraft.map((ac) => {

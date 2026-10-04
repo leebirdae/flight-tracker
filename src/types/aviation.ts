@@ -8,6 +8,13 @@ export interface Airport {
   lon: number;
 }
 
+export interface TrailPoint {
+  lat: number;
+  lon: number;
+  altitudeFt?: number;
+  timestamp: number;
+}
+
 export interface AircraftInfo {
   icao24: string; // 24-bit Mode-S Hex (e.g. "a2174b")
   ident: string; // Flight number / callsign (e.g. "SWA1542")
@@ -45,6 +52,7 @@ export interface AircraftInfo {
   messages?: number; // Total ADS-B frames received
   seenSec?: number; // Seconds since last message received
   tar1090Url?: string; // Direct link to this aircraft in local tar1090
+  trail?: TrailPoint[]; // Last 5 historical positions
 }
 
 export interface ReceiverStatus {

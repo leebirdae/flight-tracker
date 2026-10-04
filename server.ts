@@ -19,7 +19,7 @@ import {
   lookupAirline,
   lookupAircraft,
 } from './src/data/aviationReference.js';
-import { AircraftInfo, RadarDataResponse, Airport, ReceiverStatus } from './src/types/aviation.js';
+import { AircraftInfo, RadarDataResponse, Airport, ReceiverStatus, TrailPoint } from './src/types/aviation.js';
 
 dotenv.config();
 
@@ -28,6 +28,9 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// In-memory store of the last 5 positions for each tracked aircraft
+const aircraftTrails = new Map<string, TrailPoint[]>();
 
 // Enable CORS and generous JSON parsing for live aircraft feeds
 app.use((req, res, next) => {
@@ -289,6 +292,48 @@ function processTar1090Aircraft(
   const cleanBase = (receiverBaseUrl || 'http://localhost:8080').replace(/\/data\/.*$/, '').replace(/\/$/, '');
   const tar1090Url = `${cleanBase}/?icao=${icao24}`;
 
+  // Maintain last 5 positions in trail array
+  let trail = aircraftTrails.get(icao24) || [];
+  const lastPoint = trail[trail.length - 1];
+
+  const hasMoved = !lastPoint ||
+    Math.abs(lastPoint.lat - raw.lat) > 0.00008 ||
+    Math.abs(lastPoint.lon - raw.lon) > 0.00008;
+
+  if (hasMoved) {
+    trail.push({
+      lat: raw.lat,
+      lon: raw.lon,
+      altitudeFt: Math.round(altitudeFt),
+      timestamp: Date.now(),
+    });
+    // Keep exactly the last 5 positions
+    if (trail.length > 5) {
+      trail = trail.slice(-5);
+    }
+    aircraftTrails.set(icao24, trail);
+  }
+
+  // If newly seen and moving, populate initial historical trail points based on heading and speed
+  if (trail.length === 1 && speedKts > 20) {
+    const syntheticPoints: TrailPoint[] = [];
+    const backHeadingRad = ((headingDeg + 180) * Math.PI) / 180;
+    for (let i = 4; i >= 1; i--) {
+      const dtSec = i * 2.5;
+      const backDistKm = (speedKts * 1.852 * dtSec) / 3600;
+      const pLat = raw.lat + (backDistKm * Math.cos(backHeadingRad)) / 111;
+      const pLon = raw.lon + (backDistKm * Math.sin(backHeadingRad)) / (111 * Math.cos((raw.lat * Math.PI) / 180));
+      syntheticPoints.push({
+        lat: pLat,
+        lon: pLon,
+        altitudeFt: Math.round(altitudeFt - (verticalRateFpm * dtSec) / 60),
+        timestamp: Date.now() - dtSec * 1000,
+      });
+    }
+    trail = [...syntheticPoints, trail[0]];
+    aircraftTrails.set(icao24, trail);
+  }
+
   return {
     icao24,
     ident,
@@ -325,6 +370,7 @@ function processTar1090Aircraft(
     messages: typeof raw.messages === 'number' ? raw.messages : undefined,
     seenSec: typeof raw.seen === 'number' ? Math.round(raw.seen * 10) / 10 : undefined,
     tar1090Url,
+    trail,
   };
 }
 
@@ -364,7 +410,7 @@ async function fetchLocalTar1090(
   for (const candidate of candidatePaths) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2000);
+      const timeout = setTimeout(() => controller.abort(), 750);
 
       const res = await fetch(candidate, {
         headers: { Accept: 'application/json' },
@@ -382,7 +428,7 @@ async function fetchLocalTar1090(
         }
       }
     } catch {
-      // Continue trying next candidate
+      // Continue trying next candidate or bail fast
     }
   }
 

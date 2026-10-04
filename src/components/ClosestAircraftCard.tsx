@@ -262,6 +262,9 @@ export const ClosestAircraftCard: React.FC<ClosestAircraftCardProps> = ({
               {aircraft.messages !== undefined && (
                 <span className="ml-2 text-slate-500">· {aircraft.messages} frames received</span>
               )}
+              {aircraft.trail && aircraft.trail.length > 1 && (
+                <span className="ml-2 text-cyan-400 font-mono">· {aircraft.trail.length}-pt history trail</span>
+              )}
             </div>
           </div>
 

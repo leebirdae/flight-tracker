@@ -5,7 +5,7 @@ import { RadarScope } from './components/RadarScope.tsx';
 import { AviationMap } from './components/AviationMap.tsx';
 import { SectorAircraftTable } from './components/SectorAircraftTable.tsx';
 import { LocalAdsbSettingsModal } from './components/LocalAdsbSettingsModal.tsx';
-import { RadarDataResponse, AircraftInfo } from './types/aviation.js';
+import { RadarDataResponse, AircraftInfo, TrailPoint } from './types/aviation.js';
 import { radarAudio } from './utils/audio.ts';
 import { Antenna, MapPin, AlertCircle, Terminal, Radio } from 'lucide-react';
 
@@ -36,6 +36,7 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const prevClosestIdentRef = useRef<string | null>(null);
+  const trailsRef = useRef<Record<string, TrailPoint[]>>({});
 
   // Attempt direct browser fetch of local receiver (in case browser is allowed to access LAN HTTP)
   const attemptBrowserDirectFetch = useCallback(async () => {
@@ -85,6 +86,38 @@ export default function App() {
       }
 
       const data: RadarDataResponse = await res.json();
+
+      // Maintain persistent last 5 positions in trail array for each aircraft
+      if (Array.isArray(data.allAircraft)) {
+        data.allAircraft.forEach((ac) => {
+          let trail = trailsRef.current[ac.icao24] || ac.trail || [];
+          const last = trail[trail.length - 1];
+          if (!last || Math.abs(last.lat - ac.lat) > 0.00008 || Math.abs(last.lon - ac.lon) > 0.00008) {
+            trail = [...trail, { lat: ac.lat, lon: ac.lon, altitudeFt: ac.altitudeFt, timestamp: Date.now() }];
+            if (trail.length > 5) {
+              trail = trail.slice(-5);
+            }
+          }
+          trailsRef.current[ac.icao24] = trail;
+          ac.trail = trail;
+        });
+
+        if (data.closestAircraft) {
+          data.closestAircraft.trail = trailsRef.current[data.closestAircraft.icao24] || data.closestAircraft.trail;
+        }
+
+        // Keep selected aircraft updated with matching trail
+        setSelectedAircraft((prev) => {
+          if (!prev) return null;
+          const matching = data.allAircraft.find((a) => a.icao24 === prev.icao24);
+          if (matching) return matching;
+          return {
+            ...prev,
+            trail: trailsRef.current[prev.icao24] || prev.trail,
+          };
+        });
+      }
+
       setRadarData(data);
       setErrorMsg(null);
 
