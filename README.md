@@ -58,7 +58,7 @@ Log into your Debian container or terminal and run:
 apt-get update -y && apt-get install -y git
 
 # 2. Clone the repository
-git clone https://github.com/<your-username>/aeroproximity.git
+git clone https://github.com/leebirdae/flight-tracker.git
 cd aeroproximity
 
 # 3. Run the automated installer
