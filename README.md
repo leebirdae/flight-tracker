@@ -59,7 +59,7 @@ apt-get update -y && apt-get install -y git
 
 # 2. Clone the repository
 git clone https://github.com/leebirdae/flight-tracker.git
-cd aeroproximity
+cd flight-tracker
 
 # 3. Run the automated installer
 bash install.sh
